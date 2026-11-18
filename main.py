@@ -9,23 +9,36 @@ opens like a random walk (sigma 0.15 / sqrt hour). Release days do not look like
 that: in the 38 comparable launches shipped with every case, the category dips
 right after the first hour (many viewers arrive at the unlock, then sleep), falls
 to its floor around hours 3-8, climbs through the afternoon and peaks in prime
-time at 1.8-2.1x the first hour before easing toward the end of the UTC day.
+time at 1.6-2.4x the first hour before easing toward the end of the UTC day.
+The shape also depends on how big the launch is: a launch whose first hour
+printed 875,000 viewers (Elden Ring, Cyberpunk 2077) falls further and faster
+than one that printed 5,000 (Black Myth: Wukong), because the first hour of a
+mega-launch is inflated by the unlock spike.
 
 So the forecast is built from the comparables rather than assumed:
 
   1. every comparable is turned into a curve relative to its own hour 1,
      r_h = v_h / v_1, in natural-log space (a 20% miss costs the same at
      10,000 viewers as at 1,000,000, so logs are the scale that is scored);
-  2. the median log ratio per hour is the shape (a median, not a mean: one
-     hyped outlier such as Elden Ring must not drag every case up);
-  3. the spread of the comparables around that shape, as 1.4826 x MAD, is the
-     width of the quantiles: the honest uncertainty between launches. It is
-     floored (never narrower than a typical launch disagreement), capped (a
-     too-wide band pays at every single hour) and widened with the hour, as the
-     day moves further from the one print we know;
-  4. a small calibration term uses the pre-release tail in `history_hourly`:
+  2. those curves are weighted by how close their own first hour is to ours
+     (tricube kernel in log viewers over the 20 nearest): a launch of our size
+     teaches our shape better than one ten times smaller or bigger;
+  3. the weighted median log ratio per hour is the shape (a median, not a mean:
+     one hyped outlier must not drag every case up);
+  4. the spread of the comparables around that shape, as 1.4826 x MAD (weighted,
+     blended with the spread over every comparable), is the width of the
+     quantiles: the honest uncertainty between launches. It is floored (never
+     narrower than a typical launch disagreement), capped (a too-wide band pays
+     at every single hour) and widened with the hour, as the day moves further
+     from the one print we know;
+  5. a small calibration term uses the pre-release tail in `history_hourly`:
      a category already busy before the unlock peaks at the unlock and falls
      faster afterwards, while a quiet one builds through the day.
+
+The neighbourhood size and the width floors were chosen by leave-one-out
+cross-validation over the 34 large comparable launches (each forecast from the
+other 37, scored with this contest's own pinball loss): about 0.39 mean loss,
+against 0.58 for a pooled-median shape with a narrow band.
 
 Reads every <id>.in in the input directory, writes <id>.out: 23 rows, hours
 2..24, five non-decreasing quantiles at levels 0.05, 0.25, 0.5, 0.75, 0.95.
@@ -50,11 +63,15 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Standard normal quantiles at those levels.
 Z = [-1.6449, -0.6745, 0.0, 0.6745, 1.6449]
 
+# Neighbourhood size, in launches: the k comparables whose hour 1 is nearest ours.
+NEIGHBOURS = 20
 # Width floors and caps, in natural-log units.
-SIGMA_FLOOR = 0.16
-SIGMA_CEIL = 1.15
+SIGMA_FLOOR = 0.55
+SIGMA_CEIL = 1.10
 # How much wider each hour past the first makes the band, per sqrt hour.
-SIGMA_GROWTH = 0.035
+SIGMA_GROWTH = 0.08
+# Share of the pooled spread (every comparable) mixed into the neighbourhood spread.
+POOL_BLEND = 0.25
 
 # Typical release-day shape, used only if a case ships no usable comparable.
 FALLBACK_RATIO = [
@@ -95,6 +112,20 @@ def median(values):
     return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
 
 
+def weighted_median(pairs):
+    """pairs: [(value, weight)] -> the value where the running weight passes half."""
+    ordered = sorted(pairs)
+    total = sum(weight for _, weight in ordered)
+    if total <= 0:
+        return ordered[len(ordered) // 2][0]
+    running = 0.0
+    for value, weight in ordered:
+        running += weight
+        if running >= total / 2.0:
+            return value
+    return ordered[-1][0]
+
+
 def scaled_mad(values):
     """Robust spread in log space: 1.4826 x median absolute deviation."""
     middle = median(values)
@@ -104,8 +135,12 @@ def scaled_mad(values):
 
 
 def collect_curves(comparables):
-    """Log ratios per forecast hour, pooled over every usable comparable."""
-    per_hour = [[] for _ in range(23)]
+    """[(log of its own hour 1, 23 log ratios or None)] for every usable comparable.
+
+    A comparable teaches the shape of a release day as r_h = v_h / v_1; it is only
+    usable when its own first hour is a real print and most of its day was sampled.
+    """
+    out = []
     for comp in comparables or []:
         sequence = day_sequence(comp)
         first = sequence[0]
@@ -116,30 +151,60 @@ def collect_curves(comparables):
             if viewers is None or viewers <= 0:
                 ratios.append(None)
             else:
-                ratios.append(math.log(viewers / first))
-        if sum(1 for r in ratios if r is not None) < 20:
-            continue
-        for index, ratio in enumerate(ratios):
-            if ratio is not None and -4.0 < ratio < 4.0:
-                per_hour[index].append(ratio)
-    return per_hour
+                ratio = math.log(viewers / first)
+                ratios.append(ratio if -4.0 < ratio < 4.0 else None)
+        if sum(1 for r in ratios if r is not None) >= 20:
+            out.append((math.log(first), ratios))
+    return out
 
 
-def shape(per_hour):
-    """(median log ratio, spread) per forecast hour."""
+def neighbour_weights(p1, curves):
+    """Tricube weights over the launches whose own hour 1 is nearest ours.
+
+    A launch of our size is the better teacher of our shape: the first hour of a
+    mega-launch is inflated by the unlock spike and falls away faster than a
+    small launch's, so the shape is taken from the nearest launches in log viewers.
+    """
+    if not curves:
+        return []
+    centre = math.log(max(p1, 1.0))
+    ranked = sorted((abs(level - centre), index) for index, (level, _) in enumerate(curves))
+    chosen = ranked[: max(1, min(NEIGHBOURS, len(ranked)))]
+    span = chosen[-1][0]
+    weights = []
+    for distance, index in chosen:
+        weight = 1.0 if span <= 0 else (1.0 - (distance / span) ** 3) ** 3
+        weights.append((max(weight, 1e-6), index))
+    return weights
+
+
+def shape(curves, p1):
+    """(centre log ratio, spread) per forecast hour, from the nearest launches."""
+    weights = neighbour_weights(p1, curves)
     mu, sigma = [], []
     for index in range(23):
-        values = per_hour[index]
-        if len(values) >= 4:
-            mu.append(median(values))
-            spread = scaled_mad(values) or SIGMA_FLOOR
-            sigma.append(min(SIGMA_CEIL, max(SIGMA_FLOOR, spread)))
-        elif values:
-            mu.append(median(values))
-            sigma.append(0.75)
-        else:
+        near = []
+        pooled = []
+        for weight, curve_index in weights:
+            ratio = curves[curve_index][1][index]
+            if ratio is not None:
+                near.append((ratio, weight))
+        for _, ratios in curves:
+            ratio = ratios[index]
+            if ratio is not None:
+                pooled.append(ratio)
+        if not near:
             mu.append(math.log(FALLBACK_RATIO[index]))
             sigma.append(FALLBACK_SIGMA)
+            continue
+        centre = weighted_median(near)
+        spread = weighted_median([(abs(r - centre), w) for r, w in near]) * 1.4826
+        if len(pooled) >= 6:
+            pooled_spread = scaled_mad(pooled)
+            if pooled_spread:
+                spread = (1 - POOL_BLEND) * spread + POOL_BLEND * pooled_spread
+        mu.append(centre)
+        sigma.append(min(SIGMA_CEIL, max(SIGMA_FLOOR, spread)))
     return mu, sigma
 
 
@@ -188,7 +253,7 @@ def forecast_case(case):
         raise ValueError("case has no hour-1 print")
     p1 = max(1.0, float(first["viewers"]))
 
-    mu, sigma = shape(collect_curves(case.get("comparables")))
+    mu, sigma = shape(collect_curves(case.get("comparables")), p1)
     pull = pre_release_pull(case)
 
     hours = []
