@@ -208,31 +208,51 @@ def shape(curves, p1):
     return mu, sigma
 
 
-def pre_release_pull(case):
-    """Shift the shape down when the category was already busy before the unlock.
+def pre_release_baseline(case, hours_before=range(2, 14)):
+    """Mean viewers per hour in the 12 hours leading up to the unlock, or None.
 
-    A category carrying a big audience into the first hour peaks at the unlock and
-    loses it afterwards; one that starts quiet climbs through the day.
+    The window starts two hours before the day does: the hour right before the
+    unlock is often already inflated by a pre-load, so it is skipped to keep the
+    baseline a description of the ordinary night, not of the spike.
     """
     try:
         start = dt.datetime.strptime(case["day_start"], "%Y-%m-%dT%H:%M:%SZ")
         hourly = _hourly_map(case.get("history_hourly"))
+    except (KeyError, ValueError, TypeError):
+        return None
+    seen = []
+    for hours_back in hours_before:
+        key = (start - dt.timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if key in hourly:
+            seen.append(hourly[key])
+    if not seen:
+        return None
+    return sum(seen) / len(seen)
+
+
+def pre_release_pull(case):
+    """Shift the shape down when the category was already busy before the unlock.
+
+    A category carrying a big audience into the first hour (a Fortnite-size event,
+    a 24/7 channel) peaks at the unlock and then loses that standing audience;
+    one that starts quiet builds through the day. The size of the shift is read
+    from how much traffic the category already had before hour 1, measured in
+    log10 against the first hour's print, and it is clamped so a strange history
+    can never flip the shape on its own. Zero means "apply no correction".
+    """
+    try:
         first = float(case["known"][0]["viewers"])
-        if first <= 0:
-            return 0.0
-        tail = []
-        for hours_before in range(2, 14):
-            key = (start - dt.timedelta(hours=hours_before)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            if key in hourly:
-                tail.append(hourly[key])
-        if not tail:
-            return 0.0
-        ratio = (sum(tail) / len(tail)) / first
-        if ratio <= 0:
-            return 0.0
-        return max(-0.22, min(0.10, -0.42 * math.log10(max(ratio, 1e-6)) - 0.42))
-    except (KeyError, IndexError, ValueError, TypeError):
+    except (KeyError, IndexError, TypeError, ValueError):
         return 0.0
+    if first <= 0:
+        return 0.0
+    baseline = pre_release_baseline(case)
+    if baseline is None or baseline <= 0:
+        return 0.0
+    # ratio 1.0 (as busy before as in hour 1) -> -0.42; a quiet night -> near 0.
+    ratio = baseline / first
+    pull = -0.42 * math.log10(max(ratio, 1e-6)) - 0.42
+    return max(-0.22, min(0.10, pull))
 
 
 def round2(value):
@@ -245,30 +265,47 @@ def round2(value):
     return int(out) if out.is_integer() else out
 
 
-def forecast_case(case):
+def hour_one_print(case):
+    """The viewer count the rules guarantee every case carries: hour 1."""
     if case.get("levels") != LEVELS:
         raise ValueError(f"case asks for levels {case.get('levels')}, not {LEVELS}")
-    first = next((row for row in case["known"] if row["hour"] == 1), None)
+    first = next((row for row in case.get("known") or [] if row.get("hour") == 1), None)
     if first is None:
         raise ValueError("case has no hour-1 print")
-    p1 = max(1.0, float(first["viewers"]))
+    return max(1.0, float(first["viewers"]))
 
+
+def quantiles_for(p1, centre, width):
+    """Five log-normal quantiles around p1 * exp(centre), made monotone and in range.
+
+    Working in log space keeps the band symmetric in ratio terms (a doubled forecast
+    and a halved one are equally far away), which is the scale pinball loss punishes.
+    """
+    values = []
+    for z in Z:
+        value = p1 * math.exp(centre + z * width)
+        values.append(round2(max(0.5, min(1e9, value))))
+    for k in range(1, len(values)):
+        if values[k] < values[k - 1]:
+            values[k] = values[k - 1]
+    return values
+
+
+def forecast_case(case):
+    """One case in, 23 rows (hours 2..24) of five quantiles out."""
+    p1 = hour_one_print(case)
     mu, sigma = shape(collect_curves(case.get("comparables")), p1)
     pull = pre_release_pull(case)
 
     hours = []
     for index in range(23):
-        hour = index + 2
-        centre = mu[index] + pull * min(1.0, (index + 1) / 8.0)
+        # The pre-release correction fades in over the first eight hours: it speaks
+        # about the standing audience, which the day's own curve reveals gradually.
+        fade = min(1.0, (index + 1) / 8.0)
+        centre = mu[index] + pull * fade
+        # The band widens with distance from the one print we know.
         width = min(SIGMA_CEIL, sigma[index] + SIGMA_GROWTH * math.sqrt(index + 1))
-        quantiles = []
-        for z in Z:
-            value = p1 * math.exp(centre + z * width)
-            quantiles.append(round2(max(0.5, min(1e9, value))))
-        for k in range(1, 5):
-            if quantiles[k] < quantiles[k - 1]:
-                quantiles[k] = quantiles[k - 1]
-        hours.append({"hour": hour, "q": quantiles})
+        hours.append({"hour": index + 2, "q": quantiles_for(p1, centre, width)})
     return {"hours": hours}
 
 
